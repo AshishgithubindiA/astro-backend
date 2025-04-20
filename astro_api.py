@@ -146,6 +146,10 @@ def get_traits_by_sign(sign):
     }
     return traits.get(sign, "")
 
+@app.get("/")
+def read_root():
+    return {"message": "Astro API is live!"}
+
 @app.post("/users")
 def create_user(user: User):
     USERS_DB[user.user_id] = user
