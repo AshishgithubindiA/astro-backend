@@ -4,13 +4,22 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Dict, List, Optional
-from dotenv import load_dotenv
 import swisseph as swe
 import datetime
 import pytz
 import os
 import uuid
 import logging
+from dotenv import load_dotenv
+from supabase import create_client, Client
+import supabase_helpers as sb
+from memory.tiny_memory import TinyMemory
+from chains.multi_prompt_chain import MultiPromptManager
+from chains.classifier import classify_message
+
+# Load environment variables from .env file
+load_dotenv()
+
 # Setup logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -21,14 +30,19 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import RunnableSequence
 
-load_dotenv()  # Loads from .env into environment variables
-openai_api_key = os.getenv("OPENAI_API_KEY")
-
 app = FastAPI(title="Astrology API with Swiss Ephemeris")
 
 # Set Swiss Ephemeris path
 EPHE_PATH = os.environ.get("EPHE_PATH", "./ephe")
 swe.set_ephe_path(EPHE_PATH)
+memory_manager = TinyMemory()
+multi_prompt_manager = MultiPromptManager(openai_api_key=os.getenv("OPENAI_API_KEY"))
+
+# Initialize Supabase client
+supabase: Client = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_API_KEY")
+)
 
 PLANETS = [
     swe.SUN, swe.MOON, swe.MERCURY, swe.VENUS, swe.MARS,
@@ -63,7 +77,7 @@ class BirthData(BaseModel):
     timezone: str
 
 class User(BaseModel):
-    user_id: str
+    user_id: Optional[str] = None
     name: Optional[str] = None
     birth_data: BirthData
 
@@ -152,152 +166,162 @@ def read_root():
 
 @app.post("/users")
 def create_user(user: User):
-    USERS_DB[user.user_id] = user
-    return {"status": "created", "user_id": user.user_id}
+    # Generate UUID if not provided
+    user_data = user.dict()
+    if not user_data.get("user_id"):
+        user_data["user_id"] = str(uuid.uuid4())
+    
+    try:
+        result = sb.create_user(supabase, user_data)
+        if not result:
+            raise HTTPException(status_code=500, detail="Failed to create user")
+        return {"status": "created", "user_id": user_data["user_id"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/users/{user_id}")
 def get_user(user_id: str):
-    user = USERS_DB.get(user_id)
-    if not user:
+    result = sb.get_user(supabase, user_id)
+    if not result:
         raise HTTPException(status_code=404, detail="User not found")
-    return user
+    return result
 
 @app.post("/astro-profiles/generate")
 def generate_astro_profile_by_user(req: UserIdRequest):
-    user = USERS_DB.get(req.user_id)
+    user = sb.get_user(supabase, req.user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    birth = user.birth_data
-    jd = get_julian_day(birth.year, birth.month, birth.day, birth.hour, birth.minute, birth.timezone)
+
+    jd = get_julian_day(
+        user['birth_data']['year'], user['birth_data']['month'], user['birth_data']['day'],
+        user['birth_data']['hour'], user['birth_data']['minute'], user['birth_data']['timezone']
+    )
     positions = calculate_planet_positions(jd)
     sun_sign = determine_sign(positions["Sun"])
     moon_sign = determine_sign(positions["Moon"])
-    rising_sign = "Leo"  # Placeholder, real calculation requires more details
+    rising_sign = "Leo"  # TODO: Calculate properly
+
     profile = {
+        "user_id": req.user_id,
         "sun_sign": sun_sign,
         "moon_sign": moon_sign,
         "rising_sign": rising_sign,
         "natal_chart": positions
     }
-    ASTRO_PROFILES_DB[req.user_id] = profile
+
+    sb.save_astro_profile(supabase, req.user_id, profile)
     return profile
 
 @app.get("/astro-profiles/{user_id}")
 def get_astro_profile(user_id: str):
-    profile = ASTRO_PROFILES_DB.get(user_id)
+    profile = sb.get_astro_profile(supabase, user_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Astro profile not found")
     return profile
 
 @app.post("/daily-context/generate")
 def generate_daily_context(req: UserIdRequest):
-    user = USERS_DB.get(req.user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    profile = sb.get_astro_profile(supabase, req.user_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Astro profile not found")
+
     today = datetime.datetime.now()
     jd = get_julian_day(today.year, today.month, today.day, today.hour, today.minute, "UTC")
     transits = calculate_planet_positions(jd)
-    aspects = calculate_aspects(ASTRO_PROFILES_DB[req.user_id]["natal_chart"],transits)  # Placeholder
+    aspects = calculate_aspects(profile["natal_chart"], transits)
+
     context = {
+        "user_id": req.user_id,
         "date": today.strftime("%Y-%m-%d"),
-        "mood_score": 7,
+        "mood_score": 7,  # Placeholder
         "transits": transits,
         "aspects_today": aspects,
         "summary": "Moon in Cancer brings emotional sensitivity..."
     }
-    DAILY_CONTEXT_DB[f"{req.user_id}:{context['date']}"] = context
+
+    sb.save_daily_context(supabase, req.user_id, context)
     return context
 
 @app.get("/daily-context/{user_id}/{date}")
 def get_daily_context(user_id: str, date: str):
-    context = DAILY_CONTEXT_DB.get(f"{user_id}:{date}")
+    context = sb.get_daily_context(supabase, user_id, date)
     if not context:
         raise HTTPException(status_code=404, detail="Daily context not found")
     return context
 
 @app.post("/chat/message")
 def chat_message(msg: Message):
-    # Log the incoming user message
     logger.debug(f"Received message from user {msg.user_id}: {msg.message}")
-    
-    CHAT_HISTORY_DB.setdefault(msg.user_id, []).append({"role": "user", "text": msg.message})
 
-    # Fetch vibe context
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-    vibe = DAILY_CONTEXT_DB.get(f"{msg.user_id}:{today}", {})
-    profile = ASTRO_PROFILES_DB.get(msg.user_id, {})
+    vibe = sb.get_daily_context(supabase, msg.user_id, today) or {}
+    profile = sb.get_astro_profile(supabase, msg.user_id) or {}
 
-    # Log the vibe and profile data
-    logger.debug(f"User's astro profile: {profile}")
-    logger.debug(f"Today's vibe: {vibe}")
+    logger.debug(f"Profile: {profile}, Vibe: {vibe}")
 
-    # Make sure the OpenAI API key is passed via env or securely
+    openai_api_key = os.getenv("OPENAI_API_KEY")
     if not openai_api_key:
         raise HTTPException(status_code=500, detail="Missing OpenAI API key")
 
-    # Prepare inputs for the prompt
-    inputs = {
+    # Prepare extra context
+    extra_context = {
         "sun_sign": profile.get("sun_sign", ""),
         "moon_sign": profile.get("moon_sign", ""),
         "rising_sign": profile.get("rising_sign", ""),
         "summary": vibe.get("summary", ""),
         "aspects": ", ".join(vibe.get("aspects_today", [])),
-        "user_msg": msg.message
     }
 
-    # Log the final inputs before creating the prompt
-    logger.debug(f"Prompt inputs: {inputs}")
+    # Build enhanced input
+    enhanced_user_message = (
+        f"User Message: {msg.message}\n"
+        f"Sun Sign: {extra_context['sun_sign']}, Moon Sign: {extra_context['moon_sign']}, Rising: {extra_context['rising_sign']}\n"
+        f"Today's Vibe Summary: {extra_context['summary']}\n"
+        f"Important Aspects Today: {extra_context['aspects']}"
+    )
 
-    # Prepare the full prompt
-    # Prepare the full prompt
-    prompt = [
-        SystemMessage(content="You are a friendly astrology expert AI. Summarise answer in 2-3 sentences"),
-        HumanMessage(content=f"Based on this user's astro profile: Sun Sign: {inputs['sun_sign']}, Moon Sign: {inputs['moon_sign']}, Rising Sign: {inputs['rising_sign']}, and today's vibe: Summary: {inputs['summary']}, Aspects: {inputs['aspects']}. Respond to the user message with empathy and astrological insight."),
-        HumanMessage(content=inputs['user_msg'])
-    ]
+    # Classify the message
+    message_type = classify_message(msg.message)
+    logger.debug(f"Classified message type: {message_type}")
 
-    # Log the constructed prompt content
-    logger.debug(f"Constructed prompt content: {prompt}")
+    # Run multi prompt manager
+    response_text = multi_prompt_manager.run(
+        user_id=msg.user_id,
+        user_message=enhanced_user_message,
+        memory_manager=memory_manager,
+        force_type=message_type  # <- we'll add this option
+    )
 
-    # Create the ChatOpenAI instance (GPT-4o-mini)
-    chat = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, api_key=openai_api_key)
+    # Save chat to Supabase
+    sb.add_chat_message(supabase, msg.user_id, "user", msg.message)
+    sb.add_chat_message(supabase, msg.user_id, "ai", response_text)
 
-    # Send the prompt to the model
-    response = chat.generate([prompt])
-
-    # Log the response from the model
-    logger.debug(f"Response from GPT-4o-mini: {response}")
-
-    # Access the response text correctly
-    response_text = response.generations[0][0].text  # Accessing the first generation and then the text
-
-    CHAT_HISTORY_DB[msg.user_id].append({"role": "ai", "text": response_text})
-
-    # Log the final AI response
-    logger.debug(f"Final response: {response_text}")
-
+    logger.debug(f"Final AI response: {response_text}")
     return {"response": response_text}
 
 @app.get("/chat/history/{user_id}")
-def chat_history(user_id: str):
-    return CHAT_HISTORY_DB.get(user_id, [])
+def get_chat_history_api(user_id: str, limit: int = 50, offset: int = 0):
+    try:
+        chats = sb.get_chat_history(supabase, user_id, limit, offset)
+        return chats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/preferences")
 def save_preferences(pref: Preference):
-    PREFERENCES_DB[pref.user_id] = pref.preferences
+    sb.save_preferences(supabase, pref.user_id, pref.preferences)
     return {"status": "saved"}
 
 @app.get("/preferences/{user_id}")
 def get_preferences(user_id: str):
-    return PREFERENCES_DB.get(user_id, {})
+    result = sb.get_preferences(supabase, user_id)
+    if not result:
+        return {}
+    return result.get("preferences", {})
 
 @app.post("/mood/check-in")
 def mood_checkin(data: MoodCheckIn):
-    MOOD_LOG_DB.setdefault(data.user_id, []).append({
-        "mood_score": data.mood_score,
-        "note": data.note,
-        "timestamp": datetime.datetime.now().isoformat()
-    })
+    sb.log_mood_checkin(supabase, data.user_id, data.mood_score, data.note)
     return {"status": "mood logged"}
 
 # To run: `uvicorn astro_api:app --reload`
