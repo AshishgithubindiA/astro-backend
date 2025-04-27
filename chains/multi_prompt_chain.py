@@ -1,5 +1,6 @@
 from langchain.chains import LLMChain
 from langchain_openai import ChatOpenAI
+import random
 
 from chains.prompts import (
     daily_vibe_prompt,
@@ -29,6 +30,9 @@ class MultiPromptManager:
         }
 
     def run(self, user_id: str, user_message: str, memory_manager, force_type=None):
+        if len(user_message.split()) < 3 or user_message.lower() in ["ok", "hmm", "idk", "lol", "k", "whatever"]:
+            return get_tiny_reply(user_message)
+
         message_type = force_type or classify_message(user_message)
 
         # Pick prompt
@@ -45,7 +49,32 @@ class MultiPromptManager:
         response = chain.invoke({"user_message": full_input})
 
         # Update memory
-        memory_manager.add_message(user_id, "user", user_message)
-        memory_manager.add_message(user_id, "ai", response['text'])
+        emotion_tone = detect_emotion_tone(user_message)
+        memory_manager.add_message(user_id, "user", {"text": user_message, "tone": emotion_tone})
+        memory_manager.add_message(user_id, "ai", {"text": response['text'], "tone": "neutral"})
 
         return response['text']
+
+def get_tiny_reply():
+    tiny_replies = [
+        "🌸 Got you. Wanna talk about what's on your mind?",
+        "😌 No rush, just here whenever you wanna chat.",
+        "💬 Sometimes even a 'hmm' says a lot, y'know?",
+        "✨ I'm listening even to the little pauses.",
+        "🫶 Totally okay to just be here. No pressure.",
+        "🌷 Soft moments matter too. What's pulling on your heart today?",
+        "💖 I'm holding space for you, even in the silence.",
+    ]
+    return random.choice(tiny_replies)
+
+def detect_emotion_tone(text):
+    text = text.lower()
+    if any(word in text for word in ["sad", "upset", "hurt", "heartbroken", "lonely"]):
+        return "sad"
+    if any(word in text for word in ["excited", "happy", "joy", "grateful"]):
+        return "happy"
+    if any(word in text for word in ["confused", "lost", "overwhelmed"]):
+        return "confused"
+    if any(word in text for word in ["tired", "exhausted", "drained"]):
+        return "tired"
+    return "neutral"
