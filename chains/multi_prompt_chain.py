@@ -55,7 +55,7 @@ class MultiPromptManager:
 
         return response['text']
 
-def get_tiny_reply():
+def get_tiny_reply(user_message=None):
     tiny_replies = [
         "🌸 Got you. Wanna talk about what's on your mind?",
         "😌 No rush, just here whenever you wanna chat.",
